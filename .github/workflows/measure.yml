@@ -1,0 +1,20 @@
+name: browser-cost
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  measure:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: node measure.mjs
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: results.json

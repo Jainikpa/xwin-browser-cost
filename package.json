@@ -1,0 +1,8 @@
+{
+  "name": "xwin-browser-cost",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@miniben90/x-win": "3.7.0"
+  }
+}
