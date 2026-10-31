@@ -1,8 +1,10 @@
-// What reading the browser's address through UI Automation costs the browser on Windows: x-win, which reads Chrome's
-// address from the web page, against read-address.ps1, which looks only at the address bar. Each phase opens a fresh
+// What reading the browser's address through UI Automation costs the browser on Windows, with the Trakkar tracker's
+// address-bar reader (electron/native/address-bar-reader.cs, built by electron/scripts/build-address-bar-reader.js)
+// running as one long-lived process, as the tracker runs it. Each phase opens a fresh
 // browser with three tabs (a page that changes ten times a second in front, a long static page, Wikipedia), waits for
 // it to settle, then for MEASURE_MS reads the address on a timer, as the Trakkar tracker does, or not at all.
 import { execFileSync, spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
 import { appendFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -22,16 +24,15 @@ const BROWSERS = {
   edge: { exe: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', image: 'msedge' },
 };
 
-const EVERY_MINUTE = 60_000;
+const HELPER_EXE = join('electron', 'native-build', 'address-bar-reader.exe');
+const HELPER_TIMEOUT_MS = 2_000;
 const PHASES = [
-  { name: 'Chrome, no reading', browser: 'chrome', reader: null },
-  { name: 'Chrome, connect only', browser: 'chrome', reader: 'connect' },
-  { name: 'Chrome, first Edit', browser: 'chrome', reader: 'first-edit' },
-  { name: 'Chrome, toolbar then Edit', browser: 'chrome', reader: 'toolbar-edit' },
-  { name: 'Chrome, x-win', browser: 'chrome', reader: 'x-win' },
-  { name: 'Edge, no reading', browser: 'edge', reader: null },
-  { name: 'Edge, first Edit', browser: 'edge', reader: 'first-edit' },
-  { name: 'Edge, toolbar then Edit', browser: 'edge', reader: 'toolbar-edit' },
+  { name: 'Chrome, no reading', browser: 'chrome', readEveryMs: null },
+  { name: 'Chrome, helper every 60s', browser: 'chrome', readEveryMs: 60_000, typingCheck: true },
+  { name: 'Chrome, helper every 5s', browser: 'chrome', readEveryMs: 5_000 },
+  { name: 'Edge, no reading', browser: 'edge', readEveryMs: null },
+  { name: 'Edge, helper every 60s', browser: 'edge', readEveryMs: 60_000, typingCheck: true },
+  { name: 'Edge, helper every 5s', browser: 'edge', readEveryMs: 5_000 },
 ];
 
 const LIVE_PAGE = `<!doctype html><title>Live board</title>
@@ -112,16 +113,18 @@ async function runPhase(phase, origin) {
   const front = frontWindow();
   console.log('Front window before measuring', front);
   await evaluate(live, 'window.__reset()');
+  const helper = phase.readEveryMs ? startHelper() : null;
   const before = processStats(browser.image);
+  const helperBefore = helper ? processStats('address-bar-reader') : [];
   const reads = [];
   const memoryMb = [];
   const started = Date.now();
-  let nextRead = phase.reader ? started : Infinity;
+  let nextRead = phase.readEveryMs ? started : Infinity;
   let nextMemory = started + MEMORY_SAMPLE_MS;
   while (Date.now() - started < MEASURE_MS) {
     if (Date.now() >= nextRead) {
-      reads.push(phase.reader === 'x-win' ? readWithXWin() : readAddressBar(phase.reader));
-      nextRead += EVERY_MINUTE;
+      reads.push(await helper.read());
+      nextRead += phase.readEveryMs;
     }
     if (Date.now() >= nextMemory) {
       memoryMb.push(privateMb(processStats(browser.image)));
@@ -131,7 +134,10 @@ async function runPhase(phase, origin) {
   }
   const elapsedS = (Date.now() - started) / 1000;
   const after = processStats(browser.image);
+  const helperAfter = helper ? processStats('address-bar-reader') : [];
   const page = await evaluate(live, 'window.__stats()');
+  const typingRead = phase.typingCheck ? await readWhileTyping(helper) : null;
+  helper?.stop();
   const accessibility = await accessibilityMode();
 
   return {
@@ -145,6 +151,12 @@ async function runPhase(phase, origin) {
     processes: after.length,
     page,
     accessibility,
+    typingRead,
+    helper: helper && {
+      cpuSeconds: cpuSecondsBetween(helperBefore, helperAfter),
+      privateMbStart: privateMb(helperBefore),
+      privateMbEnd: privateMb(helperAfter),
+    },
   };
 }
 
@@ -200,6 +212,50 @@ function readAddressBar(variant) {
   } catch (error) {
     return { ms: performance.now() - started, error: String(error) };
   }
+}
+
+/** The tracker's reader, started once: each read sends "<id> <window handle>" and waits for its answer line. */
+function startHelper() {
+  const child = spawn(HELPER_EXE, [], { windowsHide: true });
+  const answers = new Map();
+  createInterface({ input: child.stdout }).on('line', (line) => {
+    const [id, typing, ...text] = line.split('\t');
+    answers.get(Number(id))?.({ typing: typing === '1', address: text.join('\t') });
+  });
+  child.stderr.on('data', (data) => console.log('helper stderr', String(data)));
+  let lastId = 0;
+  const read = async () => {
+    const window = activeWindow();
+    const id = ++lastId;
+    const started = performance.now();
+    const answer = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve({ error: 'timed out' }), HELPER_TIMEOUT_MS);
+      answers.set(id, (reply) => {
+        clearTimeout(timer);
+        resolve(reply);
+      });
+      child.stdin.write(`${id} ${window.id}\n`);
+    });
+    answers.delete(id);
+    return { ms: performance.now() - started, app: window.info.execName, title: window.title, ...answer };
+  };
+  return { read, stop: () => child.kill() };
+}
+
+/** Puts the cursor in the address bar, types, reads, then backs out with Escape. */
+async function readWhileTyping(helper) {
+  sendKeys('^l');
+  await sleep(500);
+  sendKeys('best pizza near');
+  await sleep(500);
+  const read = await helper.read();
+  sendKeys('{ESC}{ESC}');
+  return read;
+}
+
+function sendKeys(keys) {
+  const script = `(New-Object -ComObject WScript.Shell).SendKeys('${keys}')`;
+  execFileSync('powershell.exe', ['-NoProfile', '-Command', script]);
 }
 
 function frontWindow() {
@@ -305,12 +361,12 @@ function summaryOf(versions, results) {
     '',
     `Chrome ${versions.chrome}, Edge ${versions.edge}. Each phase: ${MEASURE_MS / 1000}s after a ${WARMUP_MS / 1000}s warm-up.`,
     '',
-    '| Phase | Reads with address | Read ms (avg / max) | Browser CPU % of one core | Private MB end (max) | Late timer ms (avg / max) | Long tasks (ms) | Accessibility on (native / web / extended) |',
-    '| --- | --- | --- | --- | --- | --- | --- | --- |',
+    '| Phase | Reads with address | Read ms (avg / max) | Browser CPU % of one core | Private MB end (max) | Late timer ms (avg / max) | Long tasks (ms) | Accessibility on (native / web / extended) | Helper CPU s / MB (start → end) |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
   ];
   for (const result of results) {
     if (result.error) {
-      lines.push(`| ${result.name} | failed: ${result.error.split('\n')[0]} | | | | | | |`);
+      lines.push(`| ${result.name} | failed: ${result.error.split('\n')[0]} | | | | | | | |`);
       continue;
     }
     const withAddress = result.reads.filter((read) => read.address).length;
@@ -321,15 +377,21 @@ function summaryOf(versions, results) {
       `| ${result.name} | ${result.reads.length ? `${withAddress}/${result.reads.length}` : '–'} | ${readMs} | ` +
         `${result.browserCpuPercentOfOneCore.toFixed(1)} | ${result.privateMbEnd.toFixed(0)} (${result.privateMbMax.toFixed(0)}) | ` +
         `${(page.avgLateMs ?? 0).toFixed(1)} / ${(page.maxLateMs ?? 0).toFixed(0)} | ${page.longTasks ?? '–'} (${(page.longTaskMs ?? 0).toFixed(0)}) | ` +
-        `${webAccessibility(result.accessibility)} |`,
+        `${webAccessibility(result.accessibility)} | ${helperCost(result.helper)} |`,
     );
   }
   lines.push('', 'Addresses read:', '');
   for (const result of results) {
     const read = result.reads?.find((each) => each.address) ?? result.reads?.[0];
-    if (read) lines.push(`- ${result.name}: ${JSON.stringify({ address: read.address, box: read.boxName, focused: read.focused, error: read.error })}`);
+    if (read) lines.push(`- ${result.name}: ${JSON.stringify({ address: read.address, typing: read.typing, error: read.error })}`);
+    if (result.typingRead) lines.push(`  - while typing: ${JSON.stringify(result.typingRead)}`);
   }
   return lines.join('\n') + '\n';
+}
+
+function helperCost(helper) {
+  if (!helper) return '–';
+  return `${helper.cpuSeconds.toFixed(2)} / ${helper.privateMbStart.toFixed(0)} → ${helper.privateMbEnd.toFixed(0)}`;
 }
 
 function webAccessibility(mode) {
