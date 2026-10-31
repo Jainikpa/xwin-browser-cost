@@ -1,6 +1,7 @@
-// What reading the browser's address with x-win (UI Automation) costs the browser on Windows. Each phase opens a
-// fresh browser with three tabs (a page that changes ten times a second in front, a long static page, Wikipedia),
-// waits for it to settle, then for MEASURE_MS reads the address on a timer, as the Trakkar tracker does, or not at all.
+// What reading the browser's address through UI Automation costs the browser on Windows: x-win, which reads Chrome's
+// address from the web page, against read-address.ps1, which looks only at the address bar. Each phase opens a fresh
+// browser with three tabs (a page that changes ten times a second in front, a long static page, Wikipedia), waits for
+// it to settle, then for MEASURE_MS reads the address on a timer, as the Trakkar tracker does, or not at all.
 import { execFileSync, spawn } from 'node:child_process';
 import { appendFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -21,15 +22,16 @@ const BROWSERS = {
   edge: { exe: 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', image: 'msedge' },
 };
 
+const EVERY_MINUTE = 60_000;
 const PHASES = [
-  { name: 'Chrome, no reading', browser: 'chrome', readEveryMs: null },
-  { name: 'Chrome, x-win every 60s', browser: 'chrome', readEveryMs: 60_000 },
-  { name: 'Chrome, x-win every 5s', browser: 'chrome', readEveryMs: 5_000 },
-  { name: 'Chrome, accessibility forced on', browser: 'chrome', readEveryMs: null, flags: ['--force-renderer-accessibility'] },
-  { name: 'Chrome, no reading (again)', browser: 'chrome', readEveryMs: null },
-  { name: 'Chrome, x-win every 60s (again)', browser: 'chrome', readEveryMs: 60_000 },
-  { name: 'Edge, no reading', browser: 'edge', readEveryMs: null },
-  { name: 'Edge, x-win every 60s', browser: 'edge', readEveryMs: 60_000 },
+  { name: 'Chrome, no reading', browser: 'chrome', reader: null },
+  { name: 'Chrome, connect only', browser: 'chrome', reader: 'connect' },
+  { name: 'Chrome, first Edit', browser: 'chrome', reader: 'first-edit' },
+  { name: 'Chrome, toolbar then Edit', browser: 'chrome', reader: 'toolbar-edit' },
+  { name: 'Chrome, x-win', browser: 'chrome', reader: 'x-win' },
+  { name: 'Edge, no reading', browser: 'edge', reader: null },
+  { name: 'Edge, first Edit', browser: 'edge', reader: 'first-edit' },
+  { name: 'Edge, toolbar then Edit', browser: 'edge', reader: 'toolbar-edit' },
 ];
 
 const LIVE_PAGE = `<!doctype html><title>Live board</title>
@@ -114,12 +116,12 @@ async function runPhase(phase, origin) {
   const reads = [];
   const memoryMb = [];
   const started = Date.now();
-  let nextRead = phase.readEveryMs ? started : Infinity;
+  let nextRead = phase.reader ? started : Infinity;
   let nextMemory = started + MEMORY_SAMPLE_MS;
   while (Date.now() - started < MEASURE_MS) {
     if (Date.now() >= nextRead) {
-      reads.push(readAddress());
-      nextRead += phase.readEveryMs;
+      reads.push(phase.reader === 'x-win' ? readWithXWin() : readAddressBar(phase.reader));
+      nextRead += EVERY_MINUTE;
     }
     if (Date.now() >= nextMemory) {
       memoryMb.push(privateMb(processStats(browser.image)));
@@ -130,7 +132,7 @@ async function runPhase(phase, origin) {
   const elapsedS = (Date.now() - started) / 1000;
   const after = processStats(browser.image);
   const page = await evaluate(live, 'window.__stats()');
-  const accessibility = phase.browser === 'chrome' ? await accessibilityMode() : null;
+  const accessibility = await accessibilityMode();
 
   return {
     name: phase.name,
@@ -177,12 +179,24 @@ async function liveTarget() {
 }
 
 /** The x-win call the tracker makes: the window in front, then its address. */
-function readAddress() {
+function readWithXWin() {
   const started = performance.now();
   try {
     const front = activeWindow();
     const address = front.url;
     return { ms: performance.now() - started, app: front.info.execName, title: front.title, address };
+  } catch (error) {
+    return { ms: performance.now() - started, error: String(error) };
+  }
+}
+
+/** read-address.ps1 in a new PowerShell; `ms` is its UI Automation time, without PowerShell's start-up. */
+function readAddressBar(variant) {
+  const started = performance.now();
+  try {
+    const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'read-address.ps1', '-Variant', variant];
+    const reply = JSON.parse(execFileSync('powershell.exe', args, { encoding: 'utf8' }).trim());
+    return { ...reply, ms: reply.uiaMs, spawnMs: performance.now() - started };
   } catch (error) {
     return { ms: performance.now() - started, error: String(error) };
   }
@@ -287,11 +301,11 @@ function startServer() {
 
 function summaryOf(versions, results) {
   const lines = [
-    '## Browser cost of x-win address reads',
+    '## Browser cost of address reads',
     '',
     `Chrome ${versions.chrome}, Edge ${versions.edge}. Each phase: ${MEASURE_MS / 1000}s after a ${WARMUP_MS / 1000}s warm-up.`,
     '',
-    '| Phase | Reads with address | Read ms (avg / max) | Browser CPU % of one core | Private MB end (max) | Late timer ms (avg / max) | Long tasks (ms) | Web accessibility on |',
+    '| Phase | Reads with address | Read ms (avg / max) | Browser CPU % of one core | Private MB end (max) | Late timer ms (avg / max) | Long tasks (ms) | Accessibility on (native / web / extended) |',
     '| --- | --- | --- | --- | --- | --- | --- | --- |',
   ];
   for (const result of results) {
@@ -312,16 +326,15 @@ function summaryOf(versions, results) {
   }
   lines.push('', 'Addresses read:', '');
   for (const result of results) {
-    const sample = result.reads?.find((read) => read.address)?.address ?? result.reads?.[0]?.error ?? '';
-    if (sample) lines.push(`- ${result.name}: ${sample}`);
+    const read = result.reads?.find((each) => each.address) ?? result.reads?.[0];
+    if (read) lines.push(`- ${result.name}: ${JSON.stringify({ address: read.address, box: read.boxName, focused: read.focused, error: read.error })}`);
   }
   return lines.join('\n') + '\n';
 }
 
 function webAccessibility(mode) {
-  if (!mode) return '–';
-  const web = mode.switches?.find((item) => /web/i.test(item.id) || /web accessibility/i.test(item.label));
-  return web ? String(web.on) : 'see results.json';
+  const on = (id) => String(mode?.switches?.find((item) => item.id === id)?.on ?? '?');
+  return `${on('native')} / ${on('web')} / ${on('extendedProperties')}`;
 }
 
 function average(values) {
